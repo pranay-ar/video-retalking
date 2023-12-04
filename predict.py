@@ -3,6 +3,7 @@
 
 import os
 import sys
+import shutil
 import argparse
 import subprocess
 import numpy as np
@@ -106,7 +107,13 @@ class Predictor(BasePredictor):
             re_preprocess=False,
         )
 
-        base_name = args.face.split("/")[-1]
+        if os.path.exists(args.tmp_dir):
+            shutil.rmtree(args.tmp_dir)
+        os.makedirs(args.tmp_dir)
+
+        # base_name = "input_face.m"   # args.face.split("/")[-1]
+        # tmp_dir = "cog_dir"
+        base_name = f"input_face{os.path.splitext(args.face)[-1]}"
 
         if args.face.split(".")[1] in ["jpg", "png", "jpeg"]:
             full_frames = [cv2.imread(args.face)]
@@ -149,73 +156,71 @@ class Predictor(BasePredictor):
         ]
 
         # get the landmark according to the detected face.
-        if (
-            not os.path.isfile("temp/" + base_name + "_landmarks.txt")
-            or args.re_preprocess
+        # if (
+        #     not os.path.isfile("temp/" + base_name + "_landmarks.txt")
+        #     or args.re_preprocess
+        # ):
+        print("[Step 1] Landmarks Extraction in Video.")
+        lm = self.kp_extractor.extract_keypoint(
+            frames_pil, f"{args.tmp_dir}/landmarks.txt"
+        )
+        # else:
+        #     print("[Step 1] Using saved landmarks.")
+        #     lm = np.loadtxt("temp/" + base_name + "_landmarks.txt").astype(np.float32)
+        #     lm = lm.reshape([len(full_frames), -1, 2])
+
+        # if (
+        #     not os.path.isfile("temp/" + base_name + "_coeffs.npy")
+        #     or args.exp_img is not None
+        #     or args.re_preprocess
+        # ):
+        video_coeffs = []
+        for idx in tqdm(
+            range(len(frames_pil)), desc="[Step 2] 3DMM Extraction In Video:"
         ):
-            print("[Step 1] Landmarks Extraction in Video.")
-            lm = self.kp_extractor.extract_keypoint(
-                frames_pil, "./temp/" + base_name + "_landmarks.txt"
+            frame = frames_pil[idx]
+            W, H = frame.size
+            lm_idx = lm[idx].reshape([-1, 2])
+            if np.mean(lm_idx) == -1:
+                lm_idx = (self.lm3d_std[:, :2] + 1) / 2.0
+                lm_idx = np.concatenate([lm_idx[:, :1] * W, lm_idx[:, 1:2] * H], 1)
+            else:
+                lm_idx[:, -1] = H - 1 - lm_idx[:, -1]
+
+            trans_params, im_idx, lm_idx, _ = align_img(frame, lm_idx, self.lm3d_std)
+            trans_params = np.array(
+                [float(item) for item in np.hsplit(trans_params, 5)]
+            ).astype(np.float32)
+            im_idx_tensor = (
+                torch.tensor(np.array(im_idx) / 255.0, dtype=torch.float32)
+                .permute(2, 0, 1)
+                .to(device)
+                .unsqueeze(0)
             )
-        else:
-            print("[Step 1] Using saved landmarks.")
-            lm = np.loadtxt("temp/" + base_name + "_landmarks.txt").astype(np.float32)
-            lm = lm.reshape([len(full_frames), -1, 2])
+            with torch.no_grad():
+                coeffs = split_coeff(self.net_recon(im_idx_tensor))
 
-        if (
-            not os.path.isfile("temp/" + base_name + "_coeffs.npy")
-            or args.exp_img is not None
-            or args.re_preprocess
-        ):
-            video_coeffs = []
-            for idx in tqdm(
-                range(len(frames_pil)), desc="[Step 2] 3DMM Extraction In Video:"
-            ):
-                frame = frames_pil[idx]
-                W, H = frame.size
-                lm_idx = lm[idx].reshape([-1, 2])
-                if np.mean(lm_idx) == -1:
-                    lm_idx = (self.lm3d_std[:, :2] + 1) / 2.0
-                    lm_idx = np.concatenate([lm_idx[:, :1] * W, lm_idx[:, 1:2] * H], 1)
-                else:
-                    lm_idx[:, -1] = H - 1 - lm_idx[:, -1]
-
-                trans_params, im_idx, lm_idx, _ = align_img(
-                    frame, lm_idx, self.lm3d_std
-                )
-                trans_params = np.array(
-                    [float(item) for item in np.hsplit(trans_params, 5)]
-                ).astype(np.float32)
-                im_idx_tensor = (
-                    torch.tensor(np.array(im_idx) / 255.0, dtype=torch.float32)
-                    .permute(2, 0, 1)
-                    .to(device)
-                    .unsqueeze(0)
-                )
-                with torch.no_grad():
-                    coeffs = split_coeff(self.net_recon(im_idx_tensor))
-
-                pred_coeff = {key: coeffs[key].cpu().numpy() for key in coeffs}
-                pred_coeff = np.concatenate(
-                    [
-                        pred_coeff["id"],
-                        pred_coeff["exp"],
-                        pred_coeff["tex"],
-                        pred_coeff["angle"],
-                        pred_coeff["gamma"],
-                        pred_coeff["trans"],
-                        trans_params[None],
-                    ],
-                    1,
-                )
-                video_coeffs.append(pred_coeff)
-            semantic_npy = np.array(video_coeffs)[:, 0]
-            np.save("temp/" + base_name + "_coeffs.npy", semantic_npy)
-        else:
-            print("[Step 2] Using saved coeffs.")
-            semantic_npy = np.load("temp/" + base_name + "_coeffs.npy").astype(
-                np.float32
+            pred_coeff = {key: coeffs[key].cpu().numpy() for key in coeffs}
+            pred_coeff = np.concatenate(
+                [
+                    pred_coeff["id"],
+                    pred_coeff["exp"],
+                    pred_coeff["tex"],
+                    pred_coeff["angle"],
+                    pred_coeff["gamma"],
+                    pred_coeff["trans"],
+                    trans_params[None],
+                ],
+                1,
             )
+            video_coeffs.append(pred_coeff)
+        semantic_npy = np.array(video_coeffs)[:, 0]
+        # np.save(f"{tmp_dir}/_coeffs.npy", semantic_npy)
+        # else:
+        #     print("[Step 2] Using saved coeffs.")
+        #     semantic_npy = np.load("temp/" + base_name + "_coeffs.npy").astype(
+        #         np.float32
+        #     )
 
         # generate the 3dmm coeff from a single image
         if args.exp_img == "smile":
@@ -231,57 +236,55 @@ class Predictor(BasePredictor):
         # load DNet, model(LNet and ENet)
         D_Net, model = load_model(args, device)
 
-        if (
-            not os.path.isfile("temp/" + base_name + "_stablized.npy")
-            or args.re_preprocess
+        # if (
+        #     not os.path.isfile("temp/" + base_name + "_stablized.npy")
+        #     or args.re_preprocess
+        # ):
+        imgs = []
+        for idx in tqdm(
+            range(len(frames_pil)),
+            desc="[Step 3] Stabilize the expression In Video:",
         ):
-            imgs = []
-            for idx in tqdm(
-                range(len(frames_pil)),
-                desc="[Step 3] Stabilize the expression In Video:",
-            ):
-                if args.one_shot:
-                    source_img = trans_image(frames_pil[0]).unsqueeze(0).to(device)
-                    semantic_source_numpy = semantic_npy[0:1]
-                else:
-                    source_img = trans_image(frames_pil[idx]).unsqueeze(0).to(device)
-                    semantic_source_numpy = semantic_npy[idx : idx + 1]
-                ratio = find_crop_norm_ratio(semantic_source_numpy, semantic_npy)
-                coeff = (
-                    transform_semantic(semantic_npy, idx, ratio).unsqueeze(0).to(device)
-                )
+            if args.one_shot:
+                source_img = trans_image(frames_pil[0]).unsqueeze(0).to(device)
+                semantic_source_numpy = semantic_npy[0:1]
+            else:
+                source_img = trans_image(frames_pil[idx]).unsqueeze(0).to(device)
+                semantic_source_numpy = semantic_npy[idx : idx + 1]
+            ratio = find_crop_norm_ratio(semantic_source_numpy, semantic_npy)
+            coeff = transform_semantic(semantic_npy, idx, ratio).unsqueeze(0).to(device)
 
-                # hacking the new expression
-                coeff[:, :64, :] = expression[None, :64, None].to(device)
-                with torch.no_grad():
-                    output = D_Net(source_img, coeff)
-                img_stablized = np.uint8(
-                    (
-                        output["fake_image"]
-                        .squeeze(0)
-                        .permute(1, 2, 0)
-                        .cpu()
-                        .clamp_(-1, 1)
-                        .numpy()
-                        + 1
-                    )
-                    / 2.0
-                    * 255
+            # hacking the new expression
+            coeff[:, :64, :] = expression[None, :64, None].to(device)
+            with torch.no_grad():
+                output = D_Net(source_img, coeff)
+            img_stablized = np.uint8(
+                (
+                    output["fake_image"]
+                    .squeeze(0)
+                    .permute(1, 2, 0)
+                    .cpu()
+                    .clamp_(-1, 1)
+                    .numpy()
+                    + 1
                 )
-                imgs.append(cv2.cvtColor(img_stablized, cv2.COLOR_RGB2BGR))
-            np.save("temp/" + base_name + "_stablized.npy", imgs)
-            del D_Net
-        else:
-            print("[Step 3] Using saved stabilized video.")
-            imgs = np.load("temp/" + base_name + "_stablized.npy")
+                / 2.0
+                * 255
+            )
+            imgs.append(cv2.cvtColor(img_stablized, cv2.COLOR_RGB2BGR))
+        # np.save("temp/" + base_name + "_stablized.npy", imgs)
+        del D_Net
+        # else:
+        #     print("[Step 3] Using saved stabilized video.")
+        #     imgs = np.load("temp/" + base_name + "_stablized.npy")
         torch.cuda.empty_cache()
 
         if not args.audio.endswith(".wav"):
             command = "ffmpeg -loglevel error -y -i {} -strict -2 {}".format(
-                args.audio, "temp/{}/temp.wav".format(args.tmp_dir)
+                args.audio, f"{args.tmp_dir}/input_audio.wav"
             )
             subprocess.call(command, shell=True)
-            args.audio = "temp/{}/temp.wav".format(args.tmp_dir)
+            args.audio = f"{args.tmp_dir}/input_audio.wav"
         wav = audio.load_wav(args.audio, 16000)
         mel = audio.melspectrogram(wav)
         if np.isnan(mel.reshape(-1)).sum() > 0:
@@ -316,7 +319,7 @@ class Predictor(BasePredictor):
 
         frame_h, frame_w = full_frames[0].shape[:-1]
         out = cv2.VideoWriter(
-            "temp/{}/result.mp4".format(args.tmp_dir),
+            f"{args.tmp_dir}/result.mp4",
             cv2.VideoWriter_fourcc(*"mp4v"),
             fps,
             (frame_w, frame_h),
@@ -427,9 +430,10 @@ class Predictor(BasePredictor):
                 out.write(pp)
         out.release()
 
-        output_file = "/tmp/output.mp4"
+        # output_file = "/tmp/output.mp4"
+        output_file = "output.mp4"
         command = "ffmpeg -loglevel error -y -i {} -i {} -strict -2 -q:v 1 {}".format(
-            args.audio, "temp/{}/result.mp4".format(args.tmp_dir), output_file
+            args.audio, f"{args.tmp_dir}/result.mp4", output_file
         )
         subprocess.call(command, shell=True)
 
