@@ -13,3 +13,6 @@ results/*
 temp/*
 segments.txt
 .DS_Store
+*.mp4
+*.wav
+*.mp3
